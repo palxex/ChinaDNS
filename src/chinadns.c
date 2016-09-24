@@ -66,6 +66,16 @@ typedef struct {
   net_mask_t *nets;
 } net_list_t;
 
+typedef struct {
+  struct in6_addr net6;
+  __uint128_t mask6;
+} net6_mask_t;
+
+typedef struct {
+  int entries;
+  net6_mask_t *nets;
+} net6_list_t;
+
 
 // avoid malloc and free
 #define BUF_SIZE 512
@@ -107,7 +117,11 @@ static int parse_ip_list();
 static char *chnroute_file = NULL;
 static net_list_t chnroute_list;
 static int parse_chnroute();
+static char *chnroute6_file = NULL;
+static net6_list_t chnroute6_list;
+static int parse_chnroute6();
 static int test_ip_in_list(struct in_addr ip, const net_list_t *netlist);
+static int test_ip6_in_list(struct in6_addr ip, const net6_list_t *netlist);
 
 static int dns_init_sockets();
 static void dns_handle_local();
@@ -190,6 +204,8 @@ int main(int argc, char **argv) {
     return EXIT_FAILURE;
   if (0 != parse_chnroute())
     return EXIT_FAILURE;
+  if (0 != parse_chnroute6())
+    return EXIT_FAILURE;
   if (0 != resolve_dns_servers())
     return EXIT_FAILURE;
   if (0 != dns_init_sockets())
@@ -248,7 +264,7 @@ static int setnonblock(int sock) {
 
 static int parse_args(int argc, char **argv) {
   int ch;
-  while ((ch = getopt(argc, argv, "hb:p:s:l:c:y:dmvV")) != -1) {
+  while ((ch = getopt(argc, argv, "hb:p:s:l:c:6:y:dmvV")) != -1) {
     switch (ch) {
       case 'h':
         usage();
@@ -264,6 +280,9 @@ static int parse_args(int argc, char **argv) {
         break;
       case 'c':
         chnroute_file = strdup(optarg);
+        break;
+      case '6':
+        chnroute6_file = strdup(optarg);
         break;
       case 'l':
         ip_list_file = strdup(optarg);
@@ -386,7 +405,7 @@ static int resolve_dns_servers() {
         break;
     }
   }
-  if (chnroute_file) {
+  if (chnroute_file && chnroute6_file) {
     if (has_chn_dns) {
       if (compression) {
         if (!has_foreign_dns) {
@@ -410,7 +429,6 @@ static int resolve_dns_servers() {
       return -1;
     }
   }
-  ERR("DOES IT HAS TRUSTED?%d\n",has_trusted_dns);
   return 0;
 }
 
@@ -423,7 +441,9 @@ static int test_dns_server_type(struct sockaddr *addr) {
     return TRUSTED_DNS;
   } else {
     if (test_ip_in_list(((struct sockaddr_in *)addr)->sin_addr,
-        &chnroute_list)) {
+        &chnroute_list)
+      ||test_ip6_in_list(((struct sockaddr_in6 *)addr)->sin6_addr,
+        &chnroute6_list)) {
       return CHN_DNS;
     } else {
       return FOREIGN_DNS;
@@ -479,6 +499,16 @@ static int cmp_net_mask(const void *a, const void *b) {
   if (neta->net.s_addr == netb->net.s_addr)
     return 0;
   if (ntohl(neta->net.s_addr) > ntohl(netb->net.s_addr))
+    return 1;
+  return -1;
+}
+
+static int cmp_net6_mask(const void *a, const void *b) {
+  net6_mask_t *neta = (net6_mask_t *)a;
+  net6_mask_t *netb = (net6_mask_t *)b;
+  if (neta->net6.s6_addr == netb->net6.s6_addr)
+    return 0;
+  if (ntohl(neta->net6.s6_addr) > ntohl(netb->net6.s6_addr))
     return 1;
   return -1;
 }
@@ -546,6 +576,69 @@ static int parse_chnroute() {
   return 0;
 }
 
+static int parse_chnroute6() {
+  FILE *fp;
+  char line_buf[32];
+  char *line;
+  size_t len = sizeof(line_buf);
+  ssize_t read;
+  char net[32];
+  chnroute6_list.entries = 0;
+  int i = 0;
+  int cidr;
+
+  if (chnroute6_file == NULL) {
+    VERR("CHNROUTE6_FILE not specified, CHNRoute6 is disabled\n");
+    return 0;
+  }
+
+  fp = fopen(chnroute6_file, "rb");
+  if (fp == NULL) {
+    ERR("fopen");
+    VERR("Can't open chnroute6: %s\n", chnroute6_file);
+    return -1;
+  }
+  while ((line = fgets(line_buf, len, fp))) {
+    chnroute6_list.entries++;
+  }
+
+  chnroute6_list.nets = calloc(chnroute6_list.entries, sizeof(net_mask_t));
+  if (0 != fseek(fp, 0, SEEK_SET)) {
+    VERR("fseek");
+    return -1;
+  }
+  while ((line = fgets(line_buf, len, fp))) {
+    char *sp_pos;
+    sp_pos = strchr(line, '\r');
+    if (sp_pos) *sp_pos = 0;
+    sp_pos = strchr(line, '\n');
+    if (sp_pos) *sp_pos = 0;
+    sp_pos = strchr(line, '/');
+    if (sp_pos) {
+      *sp_pos = 0;
+      cidr = atoi(sp_pos + 1);
+      if (cidr > 0) {
+        chnroute6_list.nets[i].mask6 = (1ULL << (128 - cidr)) - 1;
+      } else {
+        chnroute6_list.nets[i].mask6 = -1;
+      }
+    } else {
+      chnroute6_list.nets[i].mask6 = NETMASK_MIN;
+    }
+    if (0 == inet_pton(AF_INET6,line, &chnroute6_list.nets[i].net6)) {
+      VERR("invalid addr %s in %s:%d\n", line, chnroute6_file, i + 1);
+      return 1;
+    }
+    i++;
+  }
+
+  qsort(chnroute6_list.nets, chnroute6_list.entries, sizeof(net6_mask_t),
+        cmp_net6_mask);
+
+  fclose(fp);
+  return 0;
+}
+
 static int test_ip_in_list(struct in_addr ip, const net_list_t *netlist) {
   // binary search
   int l = 0, r = netlist->entries - 1;
@@ -574,6 +667,38 @@ static int test_ip_in_list(struct in_addr ip, const net_list_t *netlist) {
 #endif
   if (0 == l || (ntohl(ip.s_addr) > (ntohl(netlist->nets[l - 1].net.s_addr)
       | netlist->nets[l - 1].mask))) {
+    return 0;
+  }
+  return 1;
+}
+static int test_ip6_in_list(struct in6_addr ip, const net6_list_t *netlist) {
+  // binary search
+  int l = 0, r = netlist->entries - 1;
+  int m, cmp;
+  if (netlist->entries == 0)
+    return 0;
+  net6_mask_t ip_net;
+  ip_net.net6 = ip;
+  while (l <= r) {
+    m = (l + r) >> 1;
+    cmp = cmp_net6_mask(&netlist->nets[m], &ip_net);
+    if (cmp < 0)
+      l = m + 1;
+    else if (cmp > 0)
+      r = m - 1;
+    else
+      return 1;
+#ifdef DEBUG
+    DLOG("l=%d, r=%d\n", l, r);
+    DLOG("%s, %d\n", inet_ntoa(netlist->nets[m].net6), netlist->nets[m].mask6);
+#endif
+  }
+#ifdef DEBUG
+  DLOG("nets: %x <-> %x\n", ntohl(netlist->nets[l - 1].net6.s_addr, ntohl(ip.s_addr));
+  DLOG("mask: %x\n", netlist->nets[l - 1].mask6);
+#endif
+  if (0 == l || (ntohl(ip.s6_addr) > (ntohl(netlist->nets[l - 1].net6.s6_addr)
+      | netlist->nets[l - 1].mask6))) {
     return 0;
   }
   return 1;
@@ -800,7 +925,7 @@ static int should_filter_query(ns_msg msg, struct sockaddr *dns_addr) {
   // TODO cache result for each dns server
   int dns_is_chn = 0;
   int dns_is_foreign = 0;
-  if (chnroute_file && (dns_servers_len > 1)) {
+  if (chnroute_file && chnroute6_file && (dns_servers_len > 1)) {
     dns_is_chn = (CHN_DNS == test_dns_server_type(dns_addr));
     dns_is_foreign = !dns_is_chn;
   }
@@ -850,7 +975,34 @@ static int should_filter_query(ns_msg msg, struct sockaddr *dns_addr) {
           return 1;
         }
       }
-    } else if (type == ns_t_aaaa || type == ns_t_ptr) {
+    } else if (type == ns_t_aaaa ) {
+      char buf[128];
+      if (verbose)
+        printf("%s, ", inet_ntop(AF_INET6,(struct in6_addr *)rd,buf,128));
+      /*//no ipv6 black list logic yet
+        if (!compression && !has_trusted_dns) {
+        r = bsearch(rd, ip_list.ips, ip_list.entries, sizeof(struct in6_addr),
+                    cmp_in_addr);
+        if (r) {
+          return 1;
+        }
+      }*/
+      if (test_ip6_in_list(*(struct in6_addr *)rd, &chnroute6_list)) {
+        // result is chn
+        if (dns_is_foreign) {
+          if (bidirectional) {
+            // filter DNS result from foreign dns if result is inside chn
+            return 1;
+          }
+        }
+      } else {
+        // result is foreign
+        if (dns_is_chn) {
+          // filter DNS result from chn dns if result is outside chn
+          return 1;
+        }
+      }
+    } else if (type == ns_t_ptr) {
       // if we've got an IPv6 result or a PTR result, pass
       return 0;
     }
@@ -938,13 +1090,15 @@ static void free_delay(int pos) {
 static void usage() {
   printf("%s\n", "\
 usage: chinadns [-h] [-l IPLIST_FILE] [-b BIND_ADDR] [-p BIND_PORT]\n\
-       [-c CHNROUTE_FILE] [-s DNS] [-m] [-v] [-V]\n\
+       [-c CHNROUTE_FILE] [-6 CHNROUTE6_FILE] [-s DNS] [-m] [-v] [-V]\n\
 Forward DNS requests.\n\
 \n\
   -l IPLIST_FILE        path to ip blacklist file\n\
   -c CHNROUTE_FILE      path to china route file\n\
-                        if not specified, CHNRoute will be turned\n\
-  -d                    off enable bi-directional CHNRoute filter\n\
+                        if not specified, CHNRoute will be turned off\n\
+  -6 CHNROUTE6_FILE      path to china route file\n\
+                        if not specified, CHNRoute6 will be turned off\n\
+  -d                    enable bi-directional CHNRoute filter\n\
   -y                    delay time for suspects, default: 0.3\n\
   -b BIND_ADDR          address that listens, default: 0.0.0.0\n\
   -p BIND_PORT          port that listens, default: 53\n\
