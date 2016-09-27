@@ -77,6 +77,11 @@ typedef struct {
 } ip_list_t;
 
 typedef struct {
+  int entries;
+  struct in6_addr *ip6s;
+} ip6_list_t;
+
+typedef struct {
   struct in_addr net;
   in_addr_t mask;
 } net_mask_t;
@@ -115,8 +120,9 @@ static int dns_servers_len;
 static id_addr_t *dns_server_addrs;
 static int test_dns_server_type(struct sockaddr *addr);
 
-static int has_trusted_dns;
+static int has_trusted_dns,has_trusted_dns4,has_trusted_dns6;
 static ip_list_t trusted_dns_list;
+static ip6_list_t trusted_dns6_list;
 
 static int parse_args(int argc, char **argv);
 
@@ -351,6 +357,16 @@ static int cmp_in_addr(const void *a, const void *b) {
   return -1;
 }
 
+static int cmp_in6_addr(const void *a, const void *b) {
+  struct in6_addr *ina = (struct in6_addr *)a;
+  struct in6_addr *inb = (struct in6_addr *)b;
+  if (memcmp(ina, inb,sizeof(struct in6_addr))==0)
+    return 0;
+  if (ntohlll(get_v6_in_uint128(*ina)) > ntohlll(get_v6_in_uint128(*inb)))
+    return 1;
+  return -1;
+}
+
 static int resolve_dns_servers() {
   struct addrinfo hints;
   struct addrinfo *addr_ip;
@@ -379,19 +395,38 @@ static int resolve_dns_servers() {
   }
 
   memset(&hints, 0, sizeof(hints));
-  hints.ai_family = AF_INET;
+  hints.ai_family = PF_UNSPEC;
+  hints.ai_flags = AI_NUMERICHOST;
   hints.ai_socktype = SOCK_DGRAM; /* Datagram socket */
   token = strtok(dns_servers, ",");
   while (token) {
     char *port;
+    char *to_search;
     int is_trusted_dns = 0;
     memset(global_buf, 0, BUF_SIZE);
     strncpy(global_buf, token, BUF_SIZE - 1);
-    if ((port = (strrchr(global_buf, '#')))) {
+    to_search=global_buf;
+    if (global_buf[0] == '[') { //ipv6 bracket
+      char secbuf[BUF_SIZE];
+      char *posR=strrchr(global_buf, ']');
+      int ip_len = posR-global_buf-1;
+      if( posR <= 0 ){
+        return -1;
+      }
+      strncpy(secbuf,global_buf+1,ip_len);
+      strncpy(global_buf,secbuf,ip_len);
+      VERR("before corrupting:%s\n",global_buf);
+      global_buf[ip_len]='\0';
+      VERR("after corrupting:%s\n",global_buf);
+      to_search=posR+1;
+      VERR("v6 to_search:%s\n",to_search);
+    } 
+    if ((port = (strrchr(to_search, '#')))) {
+      VERR("v6 found:%s\n",port);
       *port = '\0';
       port++;
       is_trusted_dns = 1;
-    } else if ((port = (strrchr(global_buf, ':')))) {
+    } else if ((port = (strrchr(to_search, ':')))) {
       *port = '\0';
       port++;
     } else {
@@ -401,26 +436,49 @@ static int resolve_dns_servers() {
       VERR("%s:%s\n", gai_strerror(r), token);
       return -1;
     }
+   char outbuf[128];
     dns_server_addrs[i].addr = addr_ip->ai_addr;
     dns_server_addrs[i++].addrlen = addr_ip->ai_addrlen;
     if (is_trusted_dns) {
-      inet_aton(global_buf, &trusted_dns_list.ips[has_trusted_dns++]);
+      if( addr_ip->ai_family == AF_INET6 ){
+      VERR("seg fault?\n");
+    VERR("trust,going to add:[%s]\n",global_buf);
+        inet_pton(addr_ip->ai_family, global_buf, &trusted_dns6_list.ip6s[has_trusted_dns6++]);
+       VERR("seg fault2?\n");
+      }else
+        inet_pton(addr_ip->ai_family, global_buf, &trusted_dns_list.ips[has_trusted_dns4++]);
+      has_trusted_dns = has_trusted_dns4 + has_trusted_dns6;
     }
     token = strtok(0, ",");
+    //freeaddrinfo(addr_ip);//fix resource leaking? cannot do; it will cause everything below not work
   }
+      VERR("seg fault3?\n");
 
   qsort(trusted_dns_list.ips, trusted_dns_list.entries, sizeof(struct in_addr),
         cmp_in_addr);
+  qsort(trusted_dns6_list.ip6s, trusted_dns6_list.entries, sizeof(struct in6_addr),
+        cmp_in6_addr);
 
   for (i = 0; i < dns_servers_len; i++) {
+    char outbuf[128];
+    struct sockaddr *addr=dns_server_addrs[i].addr;
+    struct sockaddr_in *sockaddr=(struct sockaddr_in *)addr;
+    struct sockaddr_in6 *sockaddr6=(struct sockaddr_in6 *)addr;
+    struct in_addr *inaddr = &sockaddr->sin_addr;
+    struct in6_addr *in6addr = &sockaddr6->sin6_addr;
+    const char *saddr=inet_ntop(addr->sa_family,(void*)(addr->sa_family == AF_INET6 ? in6addr : inaddr),outbuf,128);
+    uint16_t sport = htons(addr->sa_family == AF_INET6? sockaddr6->sin6_port : sockaddr->sin_port);
     switch(test_dns_server_type(dns_server_addrs[i].addr)) {
       case CHN_DNS:
+         VERR("chn dns:  %s:%d\n", saddr,sport);
         has_chn_dns = 1;
         break;
       case FOREIGN_DNS:
+         VERR("foreign dns:  %s:%d\n", saddr,sport);
         has_foreign_dns = 1;
         break;
       case TRUSTED_DNS:
+         VERR("trusted dns:  %s:%d\n", saddr,sport);
         compression = 0;
         break;
     }
@@ -454,6 +512,24 @@ static int resolve_dns_servers() {
 
 static int test_dns_server_type(struct sockaddr *addr) {
   void *r;
+  char obuf[128];
+  if( addr->sa_family == AF_INET6) {
+  const char *saddr = inet_ntop(AF_INET6,&((struct sockaddr_in6 *)addr)->sin6_addr,obuf,128);
+      r = bsearch(&(((struct sockaddr_in6 *)addr)->sin6_addr),
+                      trusted_dns6_list.ip6s, trusted_dns6_list.entries,
+                      sizeof(struct in6_addr), cmp_in6_addr);
+      if (r) {
+        return TRUSTED_DNS;
+      } else {
+        if (test_ip6_in_list(((struct sockaddr_in6 *)addr)->sin6_addr,
+            &chnroute6_list)) {
+          return CHN_DNS;
+        } else {
+          return FOREIGN_DNS;
+        }
+      }
+  }else{
+  const char *saddr = inet_ntop(AF_INET,&((struct sockaddr_in *)addr)->sin_addr,obuf,128);
   r = bsearch(&(((struct sockaddr_in *)addr)->sin_addr),
                   trusted_dns_list.ips, trusted_dns_list.entries,
                   sizeof(struct in_addr), cmp_in_addr);
@@ -461,13 +537,12 @@ static int test_dns_server_type(struct sockaddr *addr) {
     return TRUSTED_DNS;
   } else {
     if (test_ip_in_list(((struct sockaddr_in *)addr)->sin_addr,
-        &chnroute_list)
-      ||test_ip6_in_list(((struct sockaddr_in6 *)addr)->sin6_addr,
-        &chnroute6_list)) {
+        &chnroute_list)) {
       return CHN_DNS;
     } else {
       return FOREIGN_DNS;
     }
+  }
   }
 }
 
@@ -744,10 +819,16 @@ static int dns_init_sockets() {
   return 0;
 }
 
-static int send_request(id_addr_t id_addr, char *buf, ssize_t len) {
-  if (verbose)
+static void send_request(id_addr_t id_addr, char *buf, ssize_t len) {
+  char outbuf[128];
+  if (verbose){
+    if(id_addr.addr->sa_family == AF_INET6)
+    printf(" %s:%d", inet_ntop(AF_INET6,&((struct sockaddr_in6 *)id_addr.addr)->sin6_addr,outbuf,128),
+                         htons(((struct sockaddr_in6 *)id_addr.addr)->sin6_port));
+    else
     printf(" %s:%d", inet_ntoa(((struct sockaddr_in *)id_addr.addr)->sin_addr),
                          htons(((struct sockaddr_in *)id_addr.addr)->sin_port));
+  }
   if (-1 == sendto(remote_sock, buf, len, 0, id_addr.addr, id_addr.addrlen))
     ERR("sendto");
 }
