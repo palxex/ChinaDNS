@@ -35,6 +35,26 @@
 
 #include "config.h"
 
+__uint128_t get_v6_in_uint128(struct in6_addr addr){
+#ifdef LITTLE_ENDIAN
+    return ((__uint128_t)addr.__u6_addr.__u6_addr32[3]) << 96 |
+           ((__uint128_t)addr.__u6_addr.__u6_addr32[2]) << 64 |
+           ((__uint128_t)addr.__u6_addr.__u6_addr32[1]) << 32 |
+           ((__uint128_t)addr.__u6_addr.__u6_addr32[0]);
+#else
+    return ((__uint128_t)addr.__u6_addr.__u6_addr32[0]) << 96 |
+           ((__uint128_t)addr.__u6_addr.__u6_addr32[1]) << 64 |
+           ((__uint128_t)addr.__u6_addr.__u6_addr32[2]) << 32 |
+           ((__uint128_t)addr.__u6_addr.__u6_addr32[3]);
+#endif
+}
+
+#ifdef LITTLE_ENDIAN
+#  define ntohlll(x) (((__uint128_t)ntohll((uint64_t)(x >> 64))) | (((__uint128_t)ntohll(((uint64_t) x)) << 64)))
+#else
+#  define ntohlll(x) x
+#endif
+
 typedef struct {
   uint16_t id;
   struct timeval ts;
@@ -506,9 +526,9 @@ static int cmp_net_mask(const void *a, const void *b) {
 static int cmp_net6_mask(const void *a, const void *b) {
   net6_mask_t *neta = (net6_mask_t *)a;
   net6_mask_t *netb = (net6_mask_t *)b;
-  if (neta->net6.s6_addr == netb->net6.s6_addr)
+  if (memcmp(&neta->net6, &netb->net6,sizeof(struct in6_addr))==0)
     return 0;
-  if (ntohl(neta->net6.s6_addr) > ntohl(netb->net6.s6_addr))
+  if (ntohlll(get_v6_in_uint128(neta->net6)) > ntohlll(get_v6_in_uint128(netb->net6)))
     return 1;
   return -1;
 }
@@ -601,6 +621,7 @@ static int parse_chnroute6() {
   while ((line = fgets(line_buf, len, fp))) {
     chnroute6_list.entries++;
   }
+   // VERR("entries:%d\n",chnroute6_list.entries);
 
   chnroute6_list.nets = calloc(chnroute6_list.entries, sizeof(net_mask_t));
   if (0 != fseek(fp, 0, SEEK_SET)) {
@@ -662,7 +683,7 @@ static int test_ip_in_list(struct in_addr ip, const net_list_t *netlist) {
 #endif
   }
 #ifdef DEBUG
-  DLOG("nets: %x <-> %x\n", ntohl(netlist->nets[l - 1].net.s_addr, ntohl(ip.s_addr));
+  DLOG("nets: %x <-> %x\n", ntohl(netlist->nets[l - 1].net.s_addr), ntohl(ip.s_addr));
   DLOG("mask: %x\n", netlist->nets[l - 1].mask);
 #endif
   if (0 == l || (ntohl(ip.s_addr) > (ntohl(netlist->nets[l - 1].net.s_addr)
@@ -688,16 +709,8 @@ static int test_ip6_in_list(struct in6_addr ip, const net6_list_t *netlist) {
       r = m - 1;
     else
       return 1;
-#ifdef DEBUG
-    DLOG("l=%d, r=%d\n", l, r);
-    DLOG("%s, %d\n", inet_ntoa(netlist->nets[m].net6), netlist->nets[m].mask6);
-#endif
   }
-#ifdef DEBUG
-  DLOG("nets: %x <-> %x\n", ntohl(netlist->nets[l - 1].net6.s_addr, ntohl(ip.s_addr));
-  DLOG("mask: %x\n", netlist->nets[l - 1].mask6);
-#endif
-  if (0 == l || (ntohl(ip.s6_addr) > (ntohl(netlist->nets[l - 1].net6.s6_addr)
+  if (0 == l || (ntohlll(get_v6_in_uint128(ip)) > (ntohlll(get_v6_in_uint128(netlist->nets[l - 1].net6))
       | netlist->nets[l - 1].mask6))) {
     return 0;
   }
@@ -1096,7 +1109,7 @@ Forward DNS requests.\n\
   -l IPLIST_FILE        path to ip blacklist file\n\
   -c CHNROUTE_FILE      path to china route file\n\
                         if not specified, CHNRoute will be turned off\n\
-  -6 CHNROUTE6_FILE      path to china route file\n\
+  -6 CHNROUTE6_FILE     path to china route file\n\
                         if not specified, CHNRoute6 will be turned off\n\
   -d                    enable bi-directional CHNRoute filter\n\
   -y                    delay time for suspects, default: 0.3\n\
@@ -1104,6 +1117,8 @@ Forward DNS requests.\n\
   -p BIND_PORT          port that listens, default: 53\n\
   -s DNS                DNS servers to use, default:\n\
                         114.114.114.114,208.67.222.222:443,8.8.8.8\n\
+                        for marking trusted DNS use # instead of : \n\
+                        ipv6 address must be surrounded in [] \n\
   -m                    use DNS compression pointer mutation\n\
                         (backlist and delaying would be disabled)\n\
   -v                    verbose logging\n\
