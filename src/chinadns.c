@@ -35,7 +35,7 @@
 
 #include "config.h"
 
-__uint128_t get_v6_in_uint128(struct in6_addr addr){
+inline __uint128_t get_v6_in_uint128(struct in6_addr addr){
 #ifdef LITTLE_ENDIAN
     return ((__uint128_t)addr.__u6_addr.__u6_addr32[3]) << 96 |
            ((__uint128_t)addr.__u6_addr.__u6_addr32[2]) << 64 |
@@ -151,7 +151,8 @@ static int test_ip6_in_list(struct in6_addr ip, const net6_list_t *netlist);
 
 static int dns_init_sockets();
 static void dns_handle_local();
-static void dns_handle_remote();
+static void dns_handle_remote4();
+static void dns_handle_remote6();
 
 static const char *hostname_from_question(ns_msg msg);
 static int should_filter_query(ns_msg msg, struct sockaddr *dns_addr);
@@ -178,7 +179,9 @@ static int delay_queue_last = 0;
 static float empty_result_delay = EMPTY_RESULT_DELAY;
 
 static int local_sock;
-static int remote_sock;
+static int remote_sock4;
+static int remote_sock6;
+static char ntop_buf[128];
 
 static void usage(void);
 
@@ -239,14 +242,17 @@ int main(int argc, char **argv) {
   if (!compression)
     memset(&delay_queue, 0, sizeof(delay_queue));
 
-  max_fd = MAX(local_sock, remote_sock) + 1;
+  max_fd = MAX(local_sock, remote_sock4) + 1;
+  max_fd = MAX(max_fd, remote_sock6) + 1;
   while (1) {
     FD_ZERO(&readset);
     FD_ZERO(&errorset);
     FD_SET(local_sock, &readset);
     FD_SET(local_sock, &errorset);
-    FD_SET(remote_sock, &readset);
-    FD_SET(remote_sock, &errorset);
+    FD_SET(remote_sock4, &readset);
+    FD_SET(remote_sock4, &errorset);
+    FD_SET(remote_sock6, &readset);
+    FD_SET(remote_sock6, &errorset);
     struct timeval timeout = {
       .tv_sec = 0,
       .tv_usec = 50 * 1000,
@@ -261,15 +267,22 @@ int main(int argc, char **argv) {
       VERR("local_sock error\n");
       return EXIT_FAILURE;
     }
-    if (FD_ISSET(remote_sock, &errorset)) {
+    if (FD_ISSET(remote_sock4, &errorset)) {
       // TODO getsockopt(..., SO_ERROR, ...);
-      VERR("remote_sock error\n");
+      VERR("remote_sock4 error\n");
+      return EXIT_FAILURE;
+    }
+    if (FD_ISSET(remote_sock6, &errorset)) {
+      // TODO getsockopt(..., SO_ERROR, ...);
+      VERR("remote_sock6 error\n");
       return EXIT_FAILURE;
     }
     if (FD_ISSET(local_sock, &readset))
       dns_handle_local();
-    if (FD_ISSET(remote_sock, &readset))
-      dns_handle_remote();
+    if (FD_ISSET(remote_sock4, &readset))
+      dns_handle_remote4();
+    if (FD_ISSET(remote_sock6, &readset))
+      dns_handle_remote6();
   }
   return EXIT_SUCCESS;
 }
@@ -387,11 +400,13 @@ static int resolve_dns_servers() {
   char *tch = strchr(dns_servers, '#');
   while (tch != NULL) {
     trusted_dns_list.entries++;
+    trusted_dns6_list.entries=trusted_dns_list.entries;
     tch = strchr(tch + 1, '#');
   }
   dns_server_addrs = calloc(dns_servers_len, sizeof(id_addr_t));
   if (trusted_dns_list.entries) {
     trusted_dns_list.ips = calloc(trusted_dns_list.entries, sizeof(struct in_addr));
+    trusted_dns6_list.ip6s = calloc(trusted_dns6_list.entries, sizeof(struct in6_addr));
   }
 
   memset(&hints, 0, sizeof(hints));
@@ -406,7 +421,7 @@ static int resolve_dns_servers() {
     memset(global_buf, 0, BUF_SIZE);
     strncpy(global_buf, token, BUF_SIZE - 1);
     to_search=global_buf;
-    if (global_buf[0] == '[') { //ipv6 bracket
+    if (global_buf[0] == '[') { //ipv6 bracket begin
       char secbuf[BUF_SIZE];
       char *posR=strrchr(global_buf, ']');
       int ip_len = posR-global_buf-1;
@@ -415,14 +430,10 @@ static int resolve_dns_servers() {
       }
       strncpy(secbuf,global_buf+1,ip_len);
       strncpy(global_buf,secbuf,ip_len);
-      VERR("before corrupting:%s\n",global_buf);
       global_buf[ip_len]='\0';
-      VERR("after corrupting:%s\n",global_buf);
       to_search=posR+1;
-      VERR("v6 to_search:%s\n",to_search);
     } 
     if ((port = (strrchr(to_search, '#')))) {
-      VERR("v6 found:%s\n",port);
       *port = '\0';
       port++;
       is_trusted_dns = 1;
@@ -436,15 +447,11 @@ static int resolve_dns_servers() {
       VERR("%s:%s\n", gai_strerror(r), token);
       return -1;
     }
-   char outbuf[128];
     dns_server_addrs[i].addr = addr_ip->ai_addr;
     dns_server_addrs[i++].addrlen = addr_ip->ai_addrlen;
     if (is_trusted_dns) {
       if( addr_ip->ai_family == AF_INET6 ){
-      VERR("seg fault?\n");
-    VERR("trust,going to add:[%s]\n",global_buf);
         inet_pton(addr_ip->ai_family, global_buf, &trusted_dns6_list.ip6s[has_trusted_dns6++]);
-       VERR("seg fault2?\n");
       }else
         inet_pton(addr_ip->ai_family, global_buf, &trusted_dns_list.ips[has_trusted_dns4++]);
       has_trusted_dns = has_trusted_dns4 + has_trusted_dns6;
@@ -452,7 +459,6 @@ static int resolve_dns_servers() {
     token = strtok(0, ",");
     //freeaddrinfo(addr_ip);//fix resource leaking? cannot do; it will cause everything below not work
   }
-      VERR("seg fault3?\n");
 
   qsort(trusted_dns_list.ips, trusted_dns_list.entries, sizeof(struct in_addr),
         cmp_in_addr);
@@ -460,13 +466,12 @@ static int resolve_dns_servers() {
         cmp_in6_addr);
 
   for (i = 0; i < dns_servers_len; i++) {
-    char outbuf[128];
     struct sockaddr *addr=dns_server_addrs[i].addr;
     struct sockaddr_in *sockaddr=(struct sockaddr_in *)addr;
     struct sockaddr_in6 *sockaddr6=(struct sockaddr_in6 *)addr;
     struct in_addr *inaddr = &sockaddr->sin_addr;
     struct in6_addr *in6addr = &sockaddr6->sin6_addr;
-    const char *saddr=inet_ntop(addr->sa_family,(void*)(addr->sa_family == AF_INET6 ? in6addr : inaddr),outbuf,128);
+    const char *saddr=inet_ntop(addr->sa_family,(void*)(addr->sa_family == AF_INET6 ? in6addr : inaddr),ntop_buf,sizeof(ntop_buf));
     uint16_t sport = htons(addr->sa_family == AF_INET6? sockaddr6->sin6_port : sockaddr->sin_port);
     switch(test_dns_server_type(dns_server_addrs[i].addr)) {
       case CHN_DNS:
@@ -512,9 +517,8 @@ static int resolve_dns_servers() {
 
 static int test_dns_server_type(struct sockaddr *addr) {
   void *r;
-  char obuf[128];
   if( addr->sa_family == AF_INET6) {
-  const char *saddr = inet_ntop(AF_INET6,&((struct sockaddr_in6 *)addr)->sin6_addr,obuf,128);
+      const char *saddr = inet_ntop(AF_INET6,&((struct sockaddr_in6 *)addr)->sin6_addr,ntop_buf,sizeof(ntop_buf));
       r = bsearch(&(((struct sockaddr_in6 *)addr)->sin6_addr),
                       trusted_dns6_list.ip6s, trusted_dns6_list.entries,
                       sizeof(struct in6_addr), cmp_in6_addr);
@@ -529,7 +533,7 @@ static int test_dns_server_type(struct sockaddr *addr) {
         }
       }
   }else{
-  const char *saddr = inet_ntop(AF_INET,&((struct sockaddr_in *)addr)->sin_addr,obuf,128);
+  const char *saddr = inet_ntop(AF_INET,&((struct sockaddr_in *)addr)->sin_addr,ntop_buf,sizeof(ntop_buf));
   r = bsearch(&(((struct sockaddr_in *)addr)->sin_addr),
                   trusted_dns_list.ips, trusted_dns_list.entries,
                   sizeof(struct in_addr), cmp_in_addr);
@@ -801,7 +805,7 @@ static int dns_init_sockets() {
   if (0 != setnonblock(local_sock))
     return -1;
   memset(&hints, 0, sizeof(hints));
-  hints.ai_family = AF_INET;
+  hints.ai_family = PF_UNSPEC;
   hints.ai_socktype = SOCK_DGRAM;
   if (0 != (r = getaddrinfo(listen_addr, listen_port, &hints, &addr_ip))) {
     VERR("%s:%s:%s\n", gai_strerror(r), listen_addr, listen_port);
@@ -813,24 +817,31 @@ static int dns_init_sockets() {
     return -1;
   }
   freeaddrinfo(addr_ip);
-  remote_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-  if (0 != setnonblock(remote_sock))
+  remote_sock4 = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (0 != setnonblock(remote_sock4))
+    return -1;
+  remote_sock6 = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+  if (0 != setnonblock(remote_sock6))
     return -1;
   return 0;
 }
 
 static void send_request(id_addr_t id_addr, char *buf, ssize_t len) {
-  char outbuf[128];
-  if (verbose){
-    if(id_addr.addr->sa_family == AF_INET6)
-    printf(" %s:%d", inet_ntop(AF_INET6,&((struct sockaddr_in6 *)id_addr.addr)->sin6_addr,outbuf,128),
-                         htons(((struct sockaddr_in6 *)id_addr.addr)->sin6_port));
-    else
-    printf(" %s:%d", inet_ntoa(((struct sockaddr_in *)id_addr.addr)->sin_addr),
-                         htons(((struct sockaddr_in *)id_addr.addr)->sin_port));
+  if(id_addr.addr->sa_family == AF_INET6){
+      if (verbose){
+        printf(" %s:%d", inet_ntop(AF_INET6,&((struct sockaddr_in6 *)id_addr.addr)->sin6_addr,ntop_buf,sizeof(ntop_buf)),
+                             htons(((struct sockaddr_in6 *)id_addr.addr)->sin6_port));
+      }
+      if (-1 == sendto(remote_sock6, buf, len, 0, id_addr.addr, id_addr.addrlen))
+        ERR("sendto");
+  }else{
+      if (verbose){
+        printf(" %s:%d", inet_ntoa(((struct sockaddr_in *)id_addr.addr)->sin_addr),
+                             htons(((struct sockaddr_in *)id_addr.addr)->sin_port));
+      }
+      if (-1 == sendto(remote_sock4, buf, len, 0, id_addr.addr, id_addr.addrlen))
+        ERR("sendto");
   }
-  if (-1 == sendto(remote_sock, buf, len, 0, id_addr.addr, id_addr.addrlen))
-    ERR("sendto");
 }
 
 static void dns_handle_local() {
@@ -900,10 +911,11 @@ static void dns_handle_local() {
           send_request(dns_server_addrs[i], global_buf, len);
           break;
         case FOREIGN_DNS:
-          if (ended)
+          if (ended){
             send_request(dns_server_addrs[i], compression_buf, len + 1);
-          else if (!has_trusted_dns)
+          }else if (!has_trusted_dns){
             send_request(dns_server_addrs[i], global_buf, len);
+          }
           break;
       }
     }
@@ -914,7 +926,7 @@ static void dns_handle_local() {
     ERR("recvfrom");
 }
 
-static void dns_handle_remote() {
+static void dns_handle_remote4() {
   struct sockaddr *src_addr = malloc(sizeof(struct sockaddr));
   socklen_t src_len = sizeof(struct sockaddr);
   uint16_t query_id;
@@ -922,7 +934,7 @@ static void dns_handle_remote() {
   const char *question_hostname;
   int r;
   ns_msg msg;
-  len = recvfrom(remote_sock, global_buf, BUF_SIZE, 0, src_addr, &src_len);
+  len = recvfrom(remote_sock4, global_buf, BUF_SIZE, 0, src_addr, &src_len);
   if (len > 0) {
     if (local_ns_initparse((const u_char *)global_buf, len, &msg) < 0) {
       ERR("local_ns_initparse");
@@ -936,6 +948,59 @@ static void dns_handle_remote() {
       LOG("response %s from %s:%d - ", question_hostname,
           inet_ntoa(((struct sockaddr_in *)src_addr)->sin_addr),
           htons(((struct sockaddr_in *)src_addr)->sin_port));
+    }
+    id_addr_t *id_addr = queue_lookup(query_id);
+    if (id_addr) {
+      id_addr->addr->sa_family = AF_INET;
+      uint16_t ns_old_id = htons(id_addr->old_id);
+      memcpy(global_buf, &ns_old_id, 2);
+      r = should_filter_query(msg, src_addr);
+      if (r == 0) {
+        if (verbose)
+          printf("pass\n");
+        if (-1 == sendto(local_sock, global_buf, len, 0, id_addr->addr,
+                         id_addr->addrlen))
+          ERR("sendto");
+      } else if (r == -1) {
+        schedule_delay(query_id, global_buf, len, id_addr->addr,
+                       id_addr->addrlen);
+        if (verbose)
+          printf("delay\n");
+      } else {
+        if (verbose)
+          printf("filter\n");
+      }
+    } else {
+      if (verbose)
+        printf("skip\n");
+    }
+    free(src_addr);
+  }
+  else
+    ERR("recvfrom");
+}
+static void dns_handle_remote6() {
+  struct sockaddr *src_addr = malloc(sizeof(struct sockaddr));
+  socklen_t src_len = sizeof(struct sockaddr);
+  uint16_t query_id;
+  ssize_t len;
+  const char *question_hostname;
+  int r;
+  ns_msg msg;
+  len = recvfrom(remote_sock6, global_buf, BUF_SIZE, 0, src_addr, &src_len);
+  if (len > 0) {
+    if (local_ns_initparse((const u_char *)global_buf, len, &msg) < 0) {
+      ERR("local_ns_initparse");
+      free(src_addr);
+      return;
+    }
+    // parse DNS query id
+    query_id = ns_msg_id(msg);
+    question_hostname = hostname_from_question(msg);
+    if (question_hostname) {
+      LOG("response %s from [%s]:%d - ", question_hostname,
+          inet_ntop(AF_INET6,&((struct sockaddr_in6 *)src_addr)->sin6_addr,ntop_buf,sizeof(ntop_buf)),
+          htons(((struct sockaddr_in6 *)src_addr)->sin6_port));
     }
     id_addr_t *id_addr = queue_lookup(query_id);
     if (id_addr) {
@@ -1070,9 +1135,8 @@ static int should_filter_query(ns_msg msg, struct sockaddr *dns_addr) {
         }
       }
     } else if (type == ns_t_aaaa ) {
-      char buf[128];
       if (verbose)
-        printf("%s, ", inet_ntop(AF_INET6,(struct in6_addr *)rd,buf,128));
+        printf("%s, ", inet_ntop(AF_INET6,(struct in6_addr *)rd,ntop_buf,sizeof(ntop_buf)));
       /*//no ipv6 black list logic yet
         if (!compression && !has_trusted_dns) {
         r = bsearch(rd, ip_list.ips, ip_list.entries, sizeof(struct in6_addr),
